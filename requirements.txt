@@ -1,0 +1,14 @@
+# Core runtime dependencies for scaffolding and core infrastructure
+pydantic==1.10.13
+redis==5.0.8
+loguru==0.7.2
+python-dotenv==1.0.1
+pytest==8.3.3
+
+# Heavy analysis libraries will be added in later milestones
+# librosa==0.10.2.post1
+# numpy==1.26.4
+# scikit-learn==1.5.2
+# pyloudnorm==0.1.1
+# spleeter==2.4.0
+# tensorflow==2.12.0
