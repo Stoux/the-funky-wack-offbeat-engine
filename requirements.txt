@@ -10,7 +10,6 @@ pytest==8.3.3
 librosa==0.10.2.post1
 numpy==1.23.5
 numba==0.59.1
-soundfile==0.12.1
 
 # Spleeter stack
 spleeter==2.4.0
