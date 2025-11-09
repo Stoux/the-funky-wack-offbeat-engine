@@ -1,20 +1,22 @@
-# Minimal Dockerfile for The Offbeat Engine (scaffold + core infra)
-# This image does NOT include heavy analysis deps yet.
+# Dockerfile for The Offbeat Engine
+# Uses Python 3.9 to be compatible with Spleeter (TensorFlow 2.9.x)
 
-FROM python:3.10-slim
+FROM python:3.9-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System deps (Redis client libs not required). ffmpeg/libsndfile will be added later.
+# System deps (include ffmpeg + libsndfile for audio decoding and Spleeter)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates \
+       ffmpeg \
+       libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python deps
+# Install Python deps (always include ML stack)
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
     && pip install --no-cache-dir -r requirements.txt
@@ -22,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
 # Copy application code
 COPY offbeat/ offbeat/
 COPY scripts/ scripts/
-COPY tech-document.txt pyproject.toml README.md ./
+COPY tech-document-v2.txt pyproject.toml README.md ./
 
 # Default environment (can be overridden)
 ENV OFFBEAT_THREADS=3 \

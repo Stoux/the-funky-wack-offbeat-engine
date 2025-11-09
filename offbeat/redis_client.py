@@ -1,5 +1,5 @@
 import json
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 import redis
 from loguru import logger
 from .config import settings
@@ -9,7 +9,7 @@ def get_client() -> redis.Redis:
     return redis.Redis.from_url(settings.redis_url, decode_responses=True)
 
 
-def pop_job_blocking(timeout: int = 5) -> Tuple[str, Any] | None:
+def pop_job_blocking(timeout: int = 5) -> Optional[Tuple[str, Any]]:
     """Pop a job from the analysis queue, blocking with timeout.
 
     Returns (queue_name, parsed_json) or None on timeout.
