@@ -15,6 +15,89 @@ from ..config import settings
 from ..logging_utils import get_logger
 
 
+
+def _overlap_fade_windows(fade: int):
+    if fade <= 0:
+        return None, None
+    fi = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fade, dtype=np.float32))
+    return fi, fi[::-1]
+
+
+def _separate_chunked(sep, stereo: np.ndarray, sr: int, chunk_sec: int, overlap_sec: int, supports_sr_kw: bool, log) -> dict:
+    """Chunked Spleeter separation with overlap-add (mono per stem).
+    - Processes stereo (N,2) in windows of chunk_sec with overlap_sec.
+    - Calls sep.separate() per chunk (with/without sample_rate kwarg).
+    - Folds each returned stem to mono and overlap-adds into full-length arrays.
+    Returns: dict[str, np.ndarray] mapping stem name -> mono waveform (float32, len N).
+    """
+    n = int(stereo.shape[0])
+    if n == 0:
+        return {}
+    win = int(max(1, chunk_sec) * sr)
+    fade = int(max(0, overlap_sec) * sr)
+    hop = max(1, win - fade)
+    fi, fo = _overlap_fade_windows(fade)
+
+    # Prepare accumulators lazily when first chunk returns keys
+    acc: dict[str, np.ndarray] = {}
+    weight = np.zeros((n,), dtype=np.float32)
+
+    start = 0
+    chunk_idx = 0
+    while start < n:
+        end = min(n, start + win)
+        chunk = stereo[start:end, :]
+        # Call Spleeter
+        pred = sep.separate(chunk, sample_rate=sr) if supports_sr_kw else sep.separate(chunk)
+        if not isinstance(pred, dict):
+            raise RuntimeError("Spleeter returned unexpected type for chunk")
+        # Initialize accumulators for keys on first chunk
+        if not acc:
+            for k in pred.keys():
+                acc[k] = np.zeros((n,), dtype=np.float32)
+        # Fold to mono and place with fades
+        for k, v in pred.items():
+            if isinstance(v, np.ndarray):
+                if v.ndim == 2 and v.shape[1] == 2:
+                    mono = v.mean(axis=1).astype(np.float32)
+                elif v.ndim == 1:
+                    mono = v.astype(np.float32)
+                else:
+                    # Try mean over smallest axis
+                    mono = v.mean(axis=int(np.argmin(v.shape))).astype(np.float32)
+            else:
+                continue
+            m = mono.shape[0]
+            if fade > 0 and m > 0:
+                if start > 0:
+                    mono[:min(fade, m)] *= fi[:min(fade, m)]
+                if end < n:
+                    w = min(fade, m)
+                    mono[m - w:m] *= fo[fade - w:fade]
+            acc[k][start:start + m] += mono
+        # Weighting for overlaps
+        wv = np.ones((end - start,), dtype=np.float32)
+        if fade > 0:
+            if start > 0:
+                w = min(fade, wv.size)
+                wv[:w] *= fi[:w]
+            if end < n:
+                w = min(fade, wv.size)
+                wv[-w:] *= fo[fade - w:fade]
+        weight[start:end] += wv
+
+        chunk_idx += 1
+        log.info("spleeter: processed chunk %d start=%.2fs end=%.2fs", chunk_idx, start/float(sr), end/float(sr))
+        start += hop
+
+    # Normalize by weight
+    weight[weight == 0] = 1.0
+    for k in list(acc.keys()):
+        acc[k] = (acc[k] / weight).astype(np.float32)
+    log.info("spleeter: chunked separation complete; chunks=%d", chunk_idx)
+    return acc
+
+
 # Lazy import within function for Spleeter to avoid hard dependency in simple tests
 
 
@@ -222,13 +305,22 @@ def run_global_analysis(job: dict) -> GlobalContext:
 
         try:
             # Some Spleeter versions accept sample_rate kwarg; others don't. Prefer feature test then fallback.
-            pred = None
+            import inspect
+            # Feature-detect whether this Spleeter version supports the 'sample_rate' kwarg
             try:
-                pred = sep.separate(stereo, sample_rate=spleeter_sr)  # type: ignore[arg-type]
-                log.debug("Spleeter separate() accepted sample_rate kwarg (sr=%d)", spleeter_sr)
-            except TypeError as te:
-                log.warning("Spleeter separate() doesn't accept 'sample_rate' kwarg on this version; proceeding without it at 44.1k. Error=%s", te)
-                pred = sep.separate(stereo)  # type: ignore[call-arg]
+                sep_sig = inspect.signature(sep.separate)
+            except Exception:
+                sep_sig = None
+            supports_sr_kw = bool(sep_sig and "sample_rate" in sep_sig.parameters)
+
+            # Chunked separation to cap memory usage; keep 4 stems
+            chunk_sec = int(getattr(settings, "spleeter_chunk_sec", 60))
+            overlap_sec = int(getattr(settings, "spleeter_overlap_sec", 5))
+            log.info(
+                "Spleeter chunked mode: chunk_sec=%ds overlap_sec=%ds supports_sr_kw=%s", chunk_sec, overlap_sec, supports_sr_kw
+            )
+            pred = _separate_chunked(sep, stereo, spleeter_sr, chunk_sec=chunk_sec, overlap_sec=overlap_sec, supports_sr_kw=supports_sr_kw, log=log)
+
             if not isinstance(pred, dict) or not pred:
                 raise RuntimeError("Spleeter returned no stems")
             # Convert stem arrays to mono robustly regardless of layout, with diagnostics

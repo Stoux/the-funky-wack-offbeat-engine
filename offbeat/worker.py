@@ -39,8 +39,16 @@ def _to_global_result(ctx: Any) -> GlobalResult:
 
 
 def chunks_to_track_results(chunks: List[Any], ctx: Any, job: Dict[str, Any]) -> List[TrackResult]:
+    # Ensure chronological order by start time, break ties by end time
+    ordered = sorted(
+        list(chunks or []),
+        key=lambda c: (
+            float(getattr(c, "start_sec", 0.0) or 0.0),
+            float(getattr(c, "end_sec", 0.0) or 0.0),
+        ),
+    )
     results: List[TrackResult] = []
-    for ch in chunks:
+    for idx, ch in enumerate(ordered):
         start = float(getattr(ch, "start_sec", 0.0) or 0.0)
         end = float(getattr(ch, "end_sec", start) or start)
         duration = max(0.0, end - start)
@@ -49,7 +57,7 @@ def chunks_to_track_results(chunks: List[Any], ctx: Any, job: Dict[str, Any]) ->
         )
         results.append(
             TrackResult(
-                track_id=int(getattr(ch, "track_id", len(results)) or len(results)),
+                track_id=idx,
                 start_time_sec=start,
                 analysis=analysis,
             )

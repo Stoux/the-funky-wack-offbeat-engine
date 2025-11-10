@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     min_track_duration_sec: int = Field(120, env="OFFBEAT_MIN_TRACK_DURATION_SEC")
     hop_length: int = Field(512, env="OFFBEAT_HOP_LENGTH")
 
+    # Spleeter chunked separation controls
+    spleeter_chunk_sec: int = Field(180, env="OFFBEAT_SPLEETER_CHUNK_SEC")
+    spleeter_overlap_sec: int = Field(15, env="OFFBEAT_SPLEETER_OVERLAP_SEC")
+
     # BPM smoothing and constraints
     bpm_min: int = Field(60, env="OFFBEAT_BPM_MIN")
     bpm_max: int = Field(190, env="OFFBEAT_BPM_MAX")
