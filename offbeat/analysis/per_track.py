@@ -163,28 +163,33 @@ def _find_musical_key(y_harm: np.ndarray, sr: int) -> str:
             return "Unknown"
         prof = prof / np.sum(prof)
         best = max(KEY_PROFILES.items(), key=lambda kv: np.corrcoef(prof, kv[1])[0, 1])[0]
-        # Map to Camelot notation
-        try:
-            name_parts = best.split()
-            tonic = name_parts[0]
-            mode = name_parts[1]  # 'Major' or 'Minor'
-            camelot_map_minor = {
-                'A': '8A', 'E': '9A', 'B': '10A', 'F#': '11A', 'C#': '12A',
-                'G#': '1A', 'D#': '2A', 'A#': '3A', 'F': '4A', 'C': '5A', 'G': '6A', 'D': '7A'
-            }
-            camelot_map_major = {
-                'C': '8B', 'G': '9B', 'D': '10B', 'A': '11B', 'E': '12B',
-                'B': '1B', 'F#': '2B', 'C#': '3B', 'G#': '4B', 'D#': '5B', 'A#': '6B', 'F': '7B'
-            }
-            code = (camelot_map_major if mode == 'Major' else camelot_map_minor).get(tonic)
-            if code:
-                pretty = f"{tonic} {mode}"
-                return f"{code} / {pretty}"
-        except Exception:
-            pass
         return best
     except Exception:
         return "Unknown"
+
+
+def _camelot_from_musical(musical: Optional[str]) -> Optional[str]:
+    if not musical or musical == "Unknown":
+        return None
+    try:
+        parts = str(musical).split()
+        tonic = parts[0]
+        mode = parts[1] if len(parts) > 1 else None
+        camelot_map_minor = {
+            'A': '8A', 'E': '9A', 'B': '10A', 'F#': '11A', 'C#': '12A',
+            'G#': '1A', 'D#': '2A', 'A#': '3A', 'F': '4A', 'C': '5A', 'G': '6A', 'D': '7A'
+        }
+        camelot_map_major = {
+            'C': '8B', 'G': '9B', 'D': '10B', 'A': '11B', 'E': '12B',
+            'B': '1B', 'F#': '2B', 'C#': '3B', 'G#': '4B', 'D#': '5B', 'A#': '6B', 'F': '7B'
+        }
+        if mode == 'Major':
+            return camelot_map_major.get(tonic)
+        if mode == 'Minor':
+            return camelot_map_minor.get(tonic)
+        return None
+    except Exception:
+        return None
 
 
 def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
@@ -207,7 +212,8 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     has_vocals = (vocal_rms is not None and vocal_rms > 0.02)
     brightness = _compute_brightness(y_chunk, sr)
     stable_bpm = _stable_bpm(drums, sr)
-    key = _find_musical_key(bass + other if (bass.size and other.size) else y_chunk, sr)
+    musical_key = _find_musical_key(bass + other if (bass.size and other.size) else y_chunk, sr)
+    camelot_key = _camelot_from_musical(musical_key)
 
     return {
         "track_id": int(getattr(chunk, "track_id", 0) or 0),
@@ -215,7 +221,10 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
         "analysis": {
             "duration_sec": duration,
             "stable_bpm": stable_bpm,
-            "key": key,
+            "key": {
+                "musical": musical_key,
+                "camelot": camelot_key,
+            },
             "loudness_lufs_total": lufs_total,
             "loudness_lufs_bass": lufs_bass,
             "average_brightness": brightness,

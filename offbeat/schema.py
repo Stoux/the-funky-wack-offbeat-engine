@@ -39,10 +39,15 @@ class TransitionPeriod(BaseModel):
     duration: Optional[float]
 
 
+class KeyInfo(BaseModel):
+    musical: Optional[str] = None  # e.g., "A Minor", "C Major", or "Unknown"
+    camelot: Optional[str] = None  # e.g., "8A", "9B"
+
+
 class TrackAnalysis(BaseModel):
     duration_sec: float
     stable_bpm: Optional[float] = None
-    key: Optional[str] = None
+    key: Optional[KeyInfo] = None
     loudness_lufs_total: Optional[float] = None
     loudness_lufs_bass: Optional[float] = None
     average_brightness: Optional[float] = None
