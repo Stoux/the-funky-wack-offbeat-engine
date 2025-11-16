@@ -19,7 +19,6 @@ from .schema import (
 from .redis_client import pop_job_blocking, push_result
 from .analysis.global_analysis import run_global_analysis
 from .analysis.track_detection import detect_tracks
-from .analysis.per_track import init_spleeter, teardown_spleeter, analyze_track_chunk
 
 
 def _to_global_result(ctx: Any) -> GlobalResult:
@@ -94,6 +93,14 @@ def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
+    # Import heavy per-track dependencies lazily to allow module import in light contexts/tests
+    try:
+        from .analysis.per_track import init_spleeter, teardown_spleeter, analyze_track_chunk
+    except Exception as e:
+        logger.error(f"Per-track analysis dependencies failed to import: {e}")
+        # Fail fast: loudness/spleeter are mandatory for worker mode
+        raise
+
     # Initialize Spleeter (ML is always required)
     logger.info("Initializing Spleeter (ML is mandatory)...")
     try:
@@ -137,7 +144,7 @@ def main():
                 # Phase 2: Track detection (module stub)
                 chunks = detect_tracks(global_ctx, job)
 
-                # Phase 3: Per-track stub in parallel (no heavy deps yet)
+                # Phase 3: Per-track analysis in parallel
                 try:
                     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -149,7 +156,7 @@ def main():
                     # Convert dicts to TrackResult models
                     tracks = [TrackResult(**d) for d in results_dicts]
                 except Exception as e:
-                    logger.warning(f"Per-track analysis stub failed, falling back to duration-only: {e}")
+                    logger.warning(f"Per-track analysis failed, falling back to duration-only: {e}")
                     tracks = chunks_to_track_results(chunks, global_ctx, job)
 
                 # Assemble and push
@@ -175,6 +182,7 @@ def main():
                 time.sleep(1)
     finally:
         try:
+            # teardown_spleeter is available if import above succeeded
             teardown_spleeter()
         except Exception:
             pass

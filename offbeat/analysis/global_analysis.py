@@ -10,6 +10,10 @@ import time
 
 import numpy as np
 import librosa
+try:
+    from librosa.feature.rhythm import tempo as lr_tempo  # librosa >= 0.10
+except Exception:  # pragma: no cover - older librosa
+    lr_tempo = librosa.beat.tempo
 
 from ..config import settings
 from ..logging_utils import get_logger
@@ -229,7 +233,7 @@ def run_global_analysis(job: dict) -> GlobalContext:
     try:
         hop_glob = 256
         onset_env_full = librosa.onset.onset_strength(y=y_trim, sr=sr, hop_length=hop_glob)
-        tg_arr = librosa.beat.tempo(onset_envelope=onset_env_full, sr=sr, hop_length=hop_glob, aggregate=np.median)
+        tg_arr = lr_tempo(onset_envelope=onset_env_full, sr=sr, hop_length=hop_glob, aggregate=np.median)
         t_global = float(tg_arr[0]) if hasattr(tg_arr, "__len__") else float(tg_arr)
         log.info("Global guide tempo (T_global)=%.2f BPM", t_global)
     except Exception:
@@ -447,13 +451,193 @@ def run_global_analysis(job: dict) -> GlobalContext:
 
     # Primary: PLP-based dynamic tempo curve (time-varying guide)
     try:
-        hop_plp = 256
-        oenv_plp = librosa.onset.onset_strength(y=y_trim, sr=sr, hop_length=hop_plp)
-        plp = librosa.beat.plp(onset_envelope=oenv_plp, sr=sr, hop_length=hop_plp)
-        # Convert PLP to dominant BPM per frame
-        bpm_grid = librosa.tempo_frequencies(plp.shape[0], sr=sr, hop_length=hop_plp)
-        idx = np.argmax(plp, axis=0)
-        bpm_series = bpm_grid[idx].astype(float)
+        # Prefer drums stem for PLP if available; fallback to full mix
+        y_plp = y_trim
+        sr_plp = sr
+        try:
+            if isinstance(stems_arrays, dict) and isinstance(stems_arrays.get("drums"), np.ndarray) and stems_arrays.get("drums").size:
+                y_plp = stems_arrays.get("drums")  # mono already
+                try:
+                    sr_plp = int(stem_sr)  # set by spleeter block
+                except Exception:
+                    sr_plp = sr
+                log.info("PLP source: using drums stem (sr=%s size=%s)", sr_plp, getattr(y_plp, "size", None))
+            else:
+                log.info("PLP source: using full mix (sr=%s size=%s)", sr_plp, getattr(y_plp, "size", None))
+        except Exception:
+            log.info("PLP source selection failed; using full mix")
+            y_plp = y_trim
+            sr_plp = sr
+
+        # Adaptive hop_length to bound frame count for long sets
+        def _choose_hop(len_samples: int, sr_local: int, target_max_frames: int = 100_000) -> int:
+            # Try 256, 512, 1024, 2048 and pick the smallest hop with frames <= cap
+            for h in (256, 512, 1024, 2048):
+                frames = int(np.ceil(len_samples / float(h))) if h > 0 else 0
+                if frames <= target_max_frames:
+                    return h
+            return 2048
+
+        hop_plp = _choose_hop(len(y_plp), sr_plp)
+        kwargs_plp = dict(tempo_min=60, tempo_max=200, win_length=256)
+
+        # Preflight diagnostics
+        try:
+            import librosa as _lb
+            lb_ver = getattr(_lb, "__version__", "?")
+        except Exception:
+            lb_ver = "?"
+        est_frames = int(np.ceil(len(y_plp) / hop_plp)) if sr_plp else -1
+        log.info(
+            "PLP preflight: sr=%d dur=%.2fs hop=%d est_frames=%d librosa=%s source=%s",
+            sr_plp, (len(y_plp)/float(sr_plp)) if sr_plp else -1.0, hop_plp, est_frames, lb_ver,
+            "drums" if y_plp is not y_trim else "mix",
+        )
+
+        # Onset envelope and stats
+        oenv_plp = librosa.onset.onset_strength(y=y_plp, sr=sr_plp, hop_length=hop_plp)
+        try:
+            o_min = float(np.nanmin(oenv_plp))
+            o_max = float(np.nanmax(oenv_plp))
+            o_mean = float(np.nanmean(oenv_plp))
+            o_nans = int(np.isnan(oenv_plp).sum())
+            log.info("PLP onset env stats: shape=%s min=%.3g max=%.3g mean=%.3g nan_ct=%d", getattr(oenv_plp, "shape", None), o_min, o_max, o_mean, o_nans)
+        except Exception:
+            pass
+        # Sanitize envelope to avoid NaN/Inf issues in PLP
+        if np.isnan(oenv_plp).any() or np.isinf(oenv_plp).any():
+            nan_ct = int(np.isnan(oenv_plp).sum())
+            log.warning("PLP onset envelope had invalid values; sanitizing (nan_ct=%d)", nan_ct)
+            oenv_plp = np.nan_to_num(oenv_plp, nan=0.0, posinf=0.0, neginf=0.0)
+            # Rebase to >=0
+            try:
+                oenv_plp = oenv_plp - float(np.min(oenv_plp))
+            except Exception:
+                pass
+
+        # Optional: PLP self-test on synthetic click (diagnostics only)
+        try:
+            if bool(getattr(settings, "plp_selftest", False)) or bool(getattr(settings, "plp_diag", False)):
+                import math
+                dur_test = 5.0
+                sr_test = int(sr_plp)
+                t = np.arange(int(dur_test * sr_test)) / float(sr_test)
+                # 2 Hz click => 120 BPM
+                y_click = np.zeros_like(t, dtype=np.float32)
+                y_click[(np.arange(int(dur_test*2)) * int(sr_test/2)).clip(max=y_click.size-1)] = 1.0
+                oenv_test = librosa.onset.onset_strength(y=y_click, sr=sr_test, hop_length=hop_plp)
+                log.info("PLP selftest: oenv_test shape=%s min=%.3g max=%.3g", getattr(oenv_test, 'shape', None), float(np.min(oenv_test)), float(np.max(oenv_test)))
+                # Try a minimal PLP call to ensure runtime path works
+                try:
+                    _ = librosa.beat.plp(onset_envelope=oenv_test, sr=sr_test, hop_length=hop_plp)
+                    log.info("PLP selftest: librosa.beat.plp(minimal) succeeded")
+                except Exception as e_st:
+                    log.warning("PLP selftest failed on librosa.beat.plp(minimal): %s: %s", type(e_st).__name__, str(e_st))
+        except Exception:
+            pass
+
+        # Discover supported kwargs via signature to avoid TypeError
+        import inspect
+        def _filter_kwargs(func, kwargs: dict) -> dict:
+            try:
+                sig = inspect.signature(func)
+                allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                return allowed
+            except Exception:
+                return kwargs
+
+        # Try legacy API first, with signature-aware kwargs; then feature.rhythm.plp
+        plp = None
+        used_method = None
+        try:
+            try:
+                kw1 = _filter_kwargs(librosa.beat.plp, kwargs_plp)
+                plp = librosa.beat.plp(onset_envelope=oenv_plp, sr=sr_plp, hop_length=hop_plp, **kw1)
+                used_method = f"librosa.beat.plp(kwargs:{list(kw1.keys())})"
+                log.debug("librosa.beat.plp with filtered kwargs succeeded (shape=%s)", getattr(plp, "shape", None))
+            except TypeError as e_kw:
+                log.warning("librosa.beat.plp rejected kwargs (TypeError: %s); retrying without kwargs", str(e_kw))
+                plp = librosa.beat.plp(onset_envelope=oenv_plp, sr=sr_plp, hop_length=hop_plp)
+                used_method = "librosa.beat.plp(minimal)"
+                log.debug("librosa.beat.plp without kwargs succeeded (shape=%s)", getattr(plp, "shape", None))
+        except Exception as e1:
+            log.warning("librosa.beat.plp failed (%s: %s); trying librosa.feature.rhythm.plp fallback", type(e1).__name__, str(e1))
+            try:
+                from librosa.feature.rhythm import plp as plp_new
+                try:
+                    kw2 = _filter_kwargs(plp_new, kwargs_plp)
+                    plp = plp_new(onset_envelope=oenv_plp, sr=sr_plp, hop_length=hop_plp, **kw2)
+                    used_method = f"feature.rhythm.plp(kwargs:{list(kw2.keys())})"
+                    log.info("Used librosa.feature.rhythm.plp with filtered kwargs")
+                except TypeError as e_kw2:
+                    log.warning("feature.rhythm.plp rejected kwargs (TypeError: %s); retrying without kwargs", str(e_kw2))
+                    plp = plp_new(onset_envelope=oenv_plp, sr=sr_plp, hop_length=hop_plp)
+                    used_method = "feature.rhythm.plp(minimal)"
+                    log.info("Used librosa.feature.rhythm.plp without kwargs")
+            except Exception:
+                plp = None
+
+        bpm_series = None
+        frame_count = None
+        if plp is not None:
+            # Convert PLP to dominant BPM per frame with robust guards to avoid IndexError
+            try:
+                # Ensure 2D shape (bins x frames)
+                # Normalize dimensionality; prefer shape=(bins, frames)
+                if isinstance(plp, np.ndarray) and plp.ndim == 1:
+                    # Interpret 1D as frames along time; set bins=1
+                    plp = plp.reshape((1, -1))
+                if not isinstance(plp, np.ndarray) or plp.ndim != 2 or plp.size == 0:
+                    raise RuntimeError(f"Invalid PLP array shape={getattr(plp, 'shape', None)}")
+
+                orig_shape = tuple(plp.shape)
+                bins = int(plp.shape[0])
+                frames = int(plp.shape[1])
+                # If frames collapsed to 1 but we expected many, it's likely transposed; fix by transpose
+                if frames <= 1 and bins > 4:
+                    try:
+                        # Use precomputed estimate to decide
+                        if isinstance(est_frames, int) and est_frames > 4:
+                            plp = plp.T
+                            log.info("PLP array transposed from %s to %s to correct frames dimension (est_frames=%s)", orig_shape, tuple(plp.shape), est_frames)
+                            bins = int(plp.shape[0])
+                            frames = int(plp.shape[1])
+                    except Exception:
+                        pass
+
+                bpm_grid = librosa.tempo_frequencies(bins, sr=sr_plp, hop_length=hop_plp)
+                idx = np.argmax(plp, axis=0)
+                # Diagnostics for indices
+                try:
+                    idx_min = int(np.min(idx)) if idx.size else -1
+                    idx_max = int(np.max(idx)) if idx.size else -1
+                    log.debug("PLP argmax indices: min=%s max=%s bins=%d frames=%d", idx_min, idx_max, bins, frames)
+                except Exception:
+                    pass
+                # Safe take to avoid IndexError on rare boundary conditions
+                bpm_series = np.take(bpm_grid, idx, mode='clip').astype(float)
+                frame_count = frames
+                log.info("PLP succeeded via %s; frames=%d bins=%d (orig_shape=%s)", used_method, frame_count, bins, orig_shape)
+            except Exception as e_conv:
+                # Re-raise as RuntimeError so outer handler logs and manages fallback/diagnostics
+                raise RuntimeError(f"PLP-to-BPM conversion failed: {type(e_conv).__name__}: {str(e_conv)}")
+        else:
+            # As a robust fallback, compute a tempogram-based dynamic tempo curve
+            try:
+                tempogram = librosa.feature.tempogram(onset_envelope=oenv_plp, sr=sr_plp, hop_length=hop_plp)
+                if isinstance(tempogram, np.ndarray) and tempogram.size:
+                    bpm_grid = librosa.tempo_frequencies(tempogram.shape[0], sr=sr_plp, hop_length=hop_plp)
+                    idx = np.argmax(tempogram, axis=0)
+                    bpm_series = bpm_grid[idx].astype(float)
+                    frame_count = tempogram.shape[1]
+                    used_method = "tempogram"
+                    log.info("Tempogram-based tempo curve computed as PLP fallback: frames=%d bins=%d", frame_count, tempogram.shape[0])
+                else:
+                    raise RuntimeError("Empty tempogram result")
+            except Exception as e_tmp:
+                # Let outer except handle ultimate fallback
+                raise RuntimeError(f"Tempogram fallback failed: {type(e_tmp).__name__}: {str(e_tmp)}")
+
         # Fold BPMs into plausible musical range [60, 200]
         def _fold(b: float) -> float:
             if not np.isfinite(b) or b <= 0:
@@ -464,14 +648,29 @@ def run_global_analysis(job: dict) -> GlobalContext:
                 b *= 0.5
             return b
         bpm_series = np.array([_fold(float(x)) for x in bpm_series], dtype=float)
-        # Frame times to absolute seconds
-        frame_times_abs = librosa.frames_to_time(np.arange(plp.shape[1]), sr=sr, hop_length=hop_plp) + time_offset_sec
-        # Resample to per-second grid
+
+        # Reconcile each frame w.r.t reference (prefer t_global) to reduce half/double slips
+        ref = None
+        try:
+            ref = float(t_global) if (t_global is not None and np.isfinite(t_global) and t_global > 0) else None
+        except Exception:
+            ref = None
+        if ref is not None:
+            def _reconcile_to_ref(b: float, ref_val: float) -> float:
+                cands = [b * 0.5, b * (2.0 / 3.0), b, b * 1.5, b * 2.0]
+                cands = [c for c in cands if 60.0 <= c <= 200.0]
+                return float(min(cands, key=lambda c: abs(c - ref_val))) if cands else b
+            bpm_series = np.array([_reconcile_to_ref(float(x), ref) for x in bpm_series], dtype=float)
+            log.info("Applied %s reconciliation toward ref=%.2f for %d frames", used_method or "PLP", ref, bpm_series.size)
+
+        # Frame times to absolute seconds (align to global timeline)
+        frame_times_abs = librosa.frames_to_time(np.arange(frame_count), sr=sr_plp, hop_length=hop_plp) + time_offset_sec
+        # Resample to per-second grid over trimmed duration
         bpm_curve = _per_second_resample(frame_times_abs.astype(float), bpm_series.astype(float), duration_sec)
         if bpm_curve:
-            log.info("PLP-based tempo curve computed: points=%d", len(bpm_curve))
-    except Exception:
-        log.exception("PLP tempo curve computation failed; will fall back to beat/onset methods")
+            log.info("%s-based tempo curve computed: points=%d (hop=%d source=%s)", (used_method or "PLP").upper(), len(bpm_curve), hop_plp, "drums" if y_plp is not y_trim else "mix")
+    except Exception as e:
+        log.exception("PLP tempo curve computation failed; will fall back to beat/onset methods (exc=%s)", type(e).__name__)
 
     if (not bpm_curve) and len(beat_times_rel) >= 4:
         # Instantaneous tempo from consecutive beat intervals
@@ -480,8 +679,14 @@ def run_global_analysis(job: dict) -> GlobalContext:
         intervals = intervals[intervals > 1e-6]
         if intervals.size >= 1:
             inst_bpm = 60.0 / intervals
-            # Reference BPM as median of instantaneous BPMs
-            ref_bpm = float(np.median(inst_bpm)) if inst_bpm.size else None
+            # Reference BPM: prefer T_global if available, else median of instantaneous BPMs
+            if t_global is not None and np.isfinite(t_global) and t_global > 0:
+                ref_bpm = float(t_global)
+                log.info("Beat-interval fallback: using T_global=%.2f as reference for folding", ref_bpm)
+            else:
+                ref_bpm = float(np.median(inst_bpm)) if inst_bpm.size else None
+                if ref_bpm is not None:
+                    log.info("Beat-interval fallback: using median(inst_bpm)=%.2f as reference for folding", ref_bpm)
 
             # Fold BPMs near plausible musical range and around reference
             def _fold_to_ref(bpm: float, ref: Optional[float]) -> float:
@@ -524,7 +729,7 @@ def run_global_analysis(job: dict) -> GlobalContext:
     if not bpm_curve:
         # Fallback: onset-based per-frame tempo series if beats insufficient
         oenv = librosa.onset.onset_strength(y=y_trim, sr=sr, hop_length=hop_length)
-        bpm_series = librosa.beat.tempo(onset_envelope=oenv, sr=sr, hop_length=hop_length, aggregate=None)
+        bpm_series = lr_tempo(onset_envelope=oenv, sr=sr, hop_length=hop_length, aggregate=None)
         # Reference BPM from global median
         ref_bpm = float(np.median(bpm_series)) if bpm_series.size else None
 

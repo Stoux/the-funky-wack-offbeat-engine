@@ -48,7 +48,36 @@ def _plain_formatter() -> logging.Formatter:
         def format(self, record: logging.LogRecord) -> str:
             job_id = getattr(record, "job_id", None)
             record.job = f"job_id={job_id} " if job_id else ""
-            record.message = record.getMessage()
+
+            # Safe formatting supporting both `{}` and `%` styles.
+            msg = record.msg
+            args = record.args if isinstance(record.args, tuple) else ()
+
+            formatted = None
+            # 1) Try brace-style formatting if it looks like a `{}` template
+            if isinstance(msg, str) and ("{" in msg and "}" in msg):
+                try:
+                    formatted = msg.format(*args)
+                except Exception:
+                    formatted = None
+            # 2) Fallback to percent-style formatting
+            if formatted is None:
+                try:
+                    if args:
+                        formatted = str(msg % args)
+                    else:
+                        formatted = str(msg)
+                except Exception:
+                    # 3) Last resort: concatenate stringified pieces
+                    try:
+                        formatted = " ".join([str(msg)] + [str(a) for a in args])
+                    except Exception:
+                        formatted = str(msg)
+
+            record.message = formatted
+            # Important: avoid default logging applying `%` again anywhere downstream
+            record.args = ()
+
             return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.created)) + \
                    f" [{record.levelname}] {record.name} {record.job}{record.message}"
     return _Adapter()

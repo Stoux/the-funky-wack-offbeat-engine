@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # Audio defaults (used later; included here for completeness)
     sample_rate: int = Field(22050, env="OFFBEAT_SAMPLE_RATE")
     silence_top_db: int = Field(40, env="OFFBEAT_SILENCE_TOP_DB")
-    min_track_duration_sec: int = Field(120, env="OFFBEAT_MIN_TRACK_DURATION_SEC")
+    min_track_duration_sec: int = Field(60, env="OFFBEAT_MIN_TRACK_DURATION_SEC")
     hop_length: int = Field(512, env="OFFBEAT_HOP_LENGTH")
 
     # Spleeter chunked separation controls
@@ -31,7 +31,12 @@ class Settings(BaseSettings):
     bpm_min: int = Field(60, env="OFFBEAT_BPM_MIN")
     bpm_max: int = Field(190, env="OFFBEAT_BPM_MAX")
     bpm_smooth_seconds: int = Field(8, env="OFFBEAT_BPM_SMOOTH_SECONDS")  # moving average window over per-second curve
-    bpm_max_dps: float = Field(1.5, env="OFFBEAT_BPM_MAX_DPS")  # max BPM change per second (delta per second)
+    bpm_max_dps: float = Field(2.5, env="OFFBEAT_BPM_MAX_DPS")  # max BPM change per second (delta per second)
+
+    # Diagnostics toggles
+    plp_selftest: bool = Field(True, env="OFFBEAT_PLP_SELFTEST")
+    plp_diag: bool = Field(True, env="OFFBEAT_PLP_DIAG")
+    diag_log_level: str = Field("", env="OFFBEAT_DIAG_LOG_LEVEL")
 
     # Shared storage mount where original files and stems live (Linux)
     shared_mount_path: str = Field("/mnt/audio-storage", env="OFFBEAT_SHARED_MOUNT_PATH")

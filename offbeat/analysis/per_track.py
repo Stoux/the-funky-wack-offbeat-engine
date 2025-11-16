@@ -3,25 +3,38 @@
 Design notes:
 - Spleeter is required. If it is not installed or cannot initialize, the
   system must fail fast: init_spleeter() raises RuntimeError.
-- When Spleeter is available, we compute stems-based features. Some metrics
-  (e.g., loudness via pyloudnorm) are optional and will be None if the optional
-  dependency is missing, but Spleeter itself is mandatory.
+- Loudness via pyloudnorm is required. If pyloudnorm is not installed, the
+  system must fail fast during import.
+- When both are available, we compute stems-based features.
 """
 from __future__ import annotations
 
 from typing import Dict, Any, Optional
 
 import numpy as np
+from offbeat.logging_utils import get_logger
+
+try:
+    from librosa.feature.rhythm import tempo as lr_tempo  # librosa >= 0.10
+except Exception:  # pragma: no cover - older librosa
+    import librosa  # type: ignore
+    lr_tempo = librosa.beat.tempo
+
+logger = get_logger("analysis.per_track")
 
 try:
     import librosa  # lightweight and already a dependency
 except Exception:  # pragma: no cover
     librosa = None  # type: ignore
 
-try:  # optional loudness
+try:  # loudness is mandatory
     import pyloudnorm as pyln  # type: ignore
-except Exception:  # pragma: no cover
-    pyln = None  # type: ignore
+    logger.info("pyloudnorm available: enabling LUFS computation")
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "pyloudnorm is required but not installed or failed to import. "
+        "Please add 'pyloudnorm' to your environment. Original error: {}".format(e)
+    )
 
 # Optional Spleeter
 _separator = None  # type: ignore
@@ -80,7 +93,14 @@ def _slice_chunk_audio(ctx, chunk) -> tuple[np.ndarray, int]:
     """Return y_chunk (mono) and sr with guards."""
     y = getattr(ctx, "y", None)
     sr = int(getattr(ctx, "sr", 22050) or 22050)
-    if y is None or librosa is None or len(y) == 0:
+    if y is None:
+        logger.warning("_slice_chunk_audio: ctx.y is None; returning empty slice at sr={}", sr)
+        return np.zeros(0, dtype=float), sr
+    if librosa is None:
+        logger.warning("_slice_chunk_audio: librosa not available; returning empty slice at sr={}", sr)
+        return np.zeros(0, dtype=float), sr
+    if len(y) == 0:
+        logger.info("_slice_chunk_audio: ctx.y is empty; returning empty slice at sr={}", sr)
         return np.zeros(0, dtype=float), sr
     t0 = float(getattr(ctx, "trimmed_start_sec", 0.0) or 0.0)
     start = max(float(getattr(chunk, "start_sec", 0.0) or 0.0) - t0, 0.0)
@@ -93,6 +113,9 @@ def _slice_chunk_audio(ctx, chunk) -> tuple[np.ndarray, int]:
     if y_chunk.ndim > 1:
         # ensure mono
         y_chunk = np.mean(y_chunk, axis=-1)
+    logger.debug("_slice_chunk_audio: start_sec={:.3f} end_sec={:.3f} -> samples [{}:{}] size={} sr={}",
+                 float(getattr(chunk, "start_sec", 0.0) or 0.0),
+                 float(getattr(chunk, "end_sec", 0.0) or 0.0), s, e, y_chunk.size, sr)
     return y_chunk.astype(float, copy=False), sr
 
 
@@ -107,12 +130,19 @@ def _compute_brightness(y_chunk: np.ndarray, sr: int) -> Optional[float]:
 
 
 def _compute_loudness(y_chunk: np.ndarray, sr: int) -> Optional[float]:
-    if pyln is None or y_chunk.size == 0:
+    if pyln is None:
+        logger.debug("_compute_loudness: pyloudnorm missing; cannot compute LUFS (size={} sr={})", y_chunk.size, sr)
+        return None
+    if y_chunk.size == 0:
+        logger.debug("_compute_loudness: empty input; cannot compute LUFS (sr={})", sr)
         return None
     try:
         meter = pyln.Meter(sr)
-        return float(meter.integrated_loudness(y_chunk))
-    except Exception:
+        lufs = float(meter.integrated_loudness(y_chunk))
+        logger.debug("_compute_loudness: computed LUFS={:.3f} (size={} sr={})", lufs, y_chunk.size, sr)
+        return lufs
+    except Exception as e:
+        logger.warning("_compute_loudness: exception during LUFS computation: {}", e)
         return None
 
 
@@ -133,21 +163,35 @@ def _slice_stem(ctx, stem_name: str, start_sec: float, end_sec: float) -> tuple[
     e = int(max(s, round(end * sr)))
     arr = stems.get(stem_name)
     if not isinstance(arr, np.ndarray) or arr.size == 0:
+        logger.info("_slice_stem: missing/empty stem '{}' -> returning empty slice (sr={} window=[{:.3f},{:.3f}] samples=[{}:{}])",
+                    stem_name, sr, start_sec, end_sec, s, e)
         return np.zeros(0, dtype=float), sr
     s = min(s, len(arr))
     e = min(e, len(arr))
-    return arr[s:e].astype(float, copy=False), sr
+    sl = arr[s:e].astype(float, copy=False)
+    logger.debug("_slice_stem: '{}' samples [{}:{}] size={} sr={}", stem_name, s, e, sl.size, sr)
+    return sl, sr
 
 
 def _local_guide_tempo(ctx, start_sec: float, end_sec: float) -> Optional[float]:
-    """Return a robust local guide tempo (median BPM) from ctx.bpm_curve in [start_sec, end_sec].
+    """Return a robust local guide tempo (median BPM) from ctx.bpm_curve over
+    the absolute window [start_sec, end_sec].
+
+    Note: bpm_curve is per-second sampled relative to trimmed_start_sec==0.
+    We convert absolute times to trimmed-relative by subtracting ctx.trimmed_start_sec.
     Falls back to None if window is empty or highly unstable.
     """
     curve = list(getattr(ctx, "bpm_curve", []) or [])
     if not curve:
         return None
-    i0 = int(max(0, np.floor(start_sec)))
-    i1 = int(max(i0, np.ceil(end_sec)))
+    t0 = float(getattr(ctx, "trimmed_start_sec", 0.0) or 0.0)
+    # Convert absolute seconds to indices in per-second bpm_curve
+    rel_start = max(0.0, float(start_sec) - t0)
+    rel_end = max(rel_start, float(end_sec) - t0)
+    i0 = int(max(0, np.floor(rel_start)))
+    i1 = int(max(i0, np.ceil(rel_end)))
+    i0 = min(i0, len(curve))
+    i1 = min(i1, len(curve))
     if i1 <= i0:
         return None
     window = curve[i0:i1]
@@ -164,6 +208,34 @@ def _local_guide_tempo(ctx, start_sec: float, end_sec: float) -> Optional[float]
             return None
     except Exception:
         pass
+
+    # Normalize the local median toward a musically plausible octave.
+    try:
+        ref = getattr(ctx, "t_global", None)
+        adjusted = med
+        if ref is not None and np.isfinite(ref) and ref > 0:
+            cands = [med * 0.5, med, med * 1.5, med * 2.0]
+            cands = [c for c in cands if 60.0 <= c <= 200.0]
+            if cands:
+                adjusted = float(min(cands, key=lambda c: abs(c - float(ref))))
+        else:
+            # If no reference, avoid half-time by preferring [90, 180] when obvious
+            if 60.0 <= med < 85.0 and (med * 2.0) <= 200.0:
+                adjusted = med * 2.0
+        if abs(adjusted - med) >= 1e-6:
+            logger.debug("_local_guide_tempo: adjusted median from %.2f -> %.2f (ref=%s)", med, adjusted, ref)
+            med = adjusted
+    except Exception:
+        pass
+
+    # Log debug info about the chosen window
+    try:
+        logger.debug(
+            "_local_guide_tempo: abs=[%.2f,%.2f] rel=[%.2f,%.2f] idx=[%d:%d] win_len=%d med=%.2f",
+            float(start_sec), float(end_sec), rel_start, rel_end, i0, i1, (i1 - i0), med,
+        )
+    except Exception:
+        pass
     return med
 
 
@@ -174,24 +246,76 @@ def _stable_bpm(y_drum: np.ndarray, sr: int, t_global: Optional[float] = None) -
         # Use finer hop for improved resolution
         hop_length = 256
         onset_env = librosa.onset.onset_strength(y=y_drum, sr=sr, hop_length=hop_length)
-        # If we have a guide tempo, use multi-candidate selection with half/double expansion
-        if t_global is not None and np.isfinite(t_global) and t_global > 0:
-            cands = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None)
+
+        # Normalize/adjust guide toward the musically plausible octave
+        raw_guide = float(t_global) if (t_global is not None and np.isfinite(t_global) and t_global > 0) else None
+        guide = raw_guide
+        if guide is not None:
+            # If guide is in a half/double octave, prefer the one in [90, 180] when possible
+            if guide < 90.0 and (guide * 2.0) <= 200.0:
+                guide = guide * 2.0
+                logger.debug("_stable_bpm: elevated low guide %.2f -> %.2f to avoid half-time bias", raw_guide, guide)
+            elif guide > 180.0 and (guide / 2.0) >= 60.0:
+                guide = guide / 2.0
+                logger.debug("_stable_bpm: reduced high guide %.2f -> %.2f to avoid double-time bias", raw_guide, guide)
+
+        # 1) Multi-candidate selection near guide using tempogram peaks
+        if guide is not None:
+            cands = lr_tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None)
             if cands is not None and len(cands) > 0:
-                expanded = []
+                expanded: list[float] = []
                 for t in cands:
-                    expanded.extend([t/2.0, t, t*2.0])
-                # Filter plausible range
-                expanded = [float(t) for t in expanded if 70.0 <= float(t) <= 200.0]
+                    tt = float(t)
+                    expanded.extend([tt / 2.0, tt, tt * 2.0])
+                # Gate to a band around guide to avoid octave slips (slightly wider than before)
+                lo = max(60.0, 0.67 * guide)
+                hi = min(200.0, 1.5 * guide)
+                expanded = [float(t) for t in expanded if lo <= float(t) <= hi]
                 if expanded:
-                    return float(min(expanded, key=lambda t: abs(t - float(t_global))))
-        # Fallback: single tempo estimate with basic half-time correction
-        tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+                    choice = float(min(expanded, key=lambda t: abs(t - guide)))
+                    logger.debug("_stable_bpm: using candidate selection near guide=%.2f -> %.3f (hop=%d)", guide, choice, hop_length)
+                    return choice
+
+        # 2) Fallback: bias beat_track toward guide with matching hop_length
+        if guide is not None:
+            tempo_bt, _ = librosa.beat.beat_track(
+                onset_envelope=onset_env,
+                sr=sr,
+                hop_length=hop_length,  # critical to match onset_env
+                start_bpm=guide,
+                tightness=100.0,
+                trim=False,
+            )
+            cands = [tempo_bt / 2.0, float(tempo_bt), float(tempo_bt) * 2.0]
+            lo = max(60.0, 0.67 * guide)
+            hi = min(200.0, 1.5 * guide)
+            cands = [c for c in cands if lo <= c <= hi]
+            if cands:
+                choice = float(min(cands, key=lambda t: abs(t - guide)))
+                logger.debug("_stable_bpm: beat_track biased to guide=%.2f -> %.3f (hop=%d)", guide, choice, hop_length)
+                return choice
+            logger.debug("_stable_bpm: beat_track returned tempo=%.3f without valid candidates (hop=%d)", float(tempo_bt), hop_length)
+            return float(tempo_bt)
+
+        # 3) Last resort: unbiased beat_track with correct hop_length
+        tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
         tempo = float(tempo)
-        if tempo < 90:
-            tempo *= 2.0
+        # Reconcile last-resort tempo toward guide if available, else simple half-time fix
+        if np.isfinite(tempo) and tempo > 0:
+            if guide is not None:
+                # Snap to nearest of {T/2, T, 2T} around the (adjusted) guide
+                cands = [tempo / 2.0, tempo, tempo * 2.0]
+                # Keep within plausible range
+                cands = [c for c in cands if 60.0 <= c <= 200.0]
+                if cands:
+                    tempo = float(min(cands, key=lambda t: abs(t - guide)))
+            else:
+                if tempo < 90.0:
+                    tempo *= 2.0
+        logger.debug("_stable_bpm: last-resort beat_track tempo=%.3f (hop=%d)", tempo, hop_length)
         return tempo
-    except Exception:
+    except Exception as e:
+        logger.warning("_stable_bpm: exception during tempo estimation: {}", e)
         return None
 
 
@@ -247,6 +371,12 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     other, _ = _slice_stem(ctx, "other", start, end)
     vocals, _ = _slice_stem(ctx, "vocals", start, end)
 
+    logger.info(
+        "analyze_track_chunk: track_id={} window=[{:.3f},{:.3f}] dur={:.3f}s sr={} sizes: y={} drums={} bass={} other={} vocals={}",
+        int(getattr(chunk, "track_id", 0) or 0), start, end, duration, sr,
+        y_chunk.size, drums.size, bass.size, other.size, vocals.size,
+    )
+
     # Features
     lufs_total = _compute_loudness(y_chunk, sr)
     lufs_bass = _compute_loudness(bass, sr)
@@ -255,10 +385,19 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     brightness = _compute_brightness(y_chunk, sr)
     # Derive local guide tempo from global bpm_curve over this chunk's window; fallback to global
     t_local = _local_guide_tempo(ctx, start, end)
-    guide = t_local if (t_local is not None) else getattr(ctx, "t_global", None)
+    t_global = getattr(ctx, "t_global", None)
+    guide = t_local if (t_local is not None) else t_global
+    logger.info(
+        "bpm guide window: start=%.2f end=%.2f t_local=%s t_global=%s", start, end, t_local, t_global
+    )
     stable_bpm = _stable_bpm(drums, sr, guide)
     musical_key = _find_musical_key(bass + other if (bass.size and other.size) else y_chunk, sr)
     camelot_key = _camelot_from_musical(musical_key)
+
+    logger.info(
+        "analyze_track_chunk: results track_id={} LUFS_total={} LUFS_bass={} brightness={} has_vocals={} vocal_rms={} stable_bpm={} key_musical={} key_camelot={} guide_bpm={}",
+        int(getattr(chunk, "track_id", 0) or 0), lufs_total, lufs_bass, brightness, has_vocals, vocal_rms, stable_bpm, musical_key, camelot_key, guide,
+    )
 
     return {
         "track_id": int(getattr(chunk, "track_id", 0) or 0),
