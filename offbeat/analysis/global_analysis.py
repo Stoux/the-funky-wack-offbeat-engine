@@ -158,8 +158,11 @@ class GlobalContext:
     # v2 additions
     stems_arrays: Optional[Dict[str, np.ndarray]] = None  # mono arrays for slicing
     stems: Dict[str, str] = None  # relative paths to saved stems
+    stems_sr: Optional[Dict[str, int]] = None  # true sample rates per stem name
     # Guide tempo derived from full mix (BPM)
     t_global: Optional[float] = None
+    # Drum-based beat grid in absolute seconds (from untrimmed stems)
+    drum_beat_times: Optional[List[float]] = None
 
 
 def _per_second_resample(times: np.ndarray, values: np.ndarray, duration_sec: float) -> List[float]:
@@ -243,6 +246,7 @@ def run_global_analysis(job: dict) -> GlobalContext:
     # v2: attempt full-file Spleeter separation and save stems as WAV
     stems_arrays: Optional[Dict[str, np.ndarray]] = None
     stems_paths: Dict[str, str] = {}
+    stems_sr_map: Optional[Dict[str, int]] = None
 
     # Pre-log helpful context for troubleshooting
     try:
@@ -375,6 +379,8 @@ def run_global_analysis(job: dict) -> GlobalContext:
                 stems_arrays[k] = mono.astype(np.float32)
                 log.debug("Folded stem '%s' to mono shape=%s seconds=%.2f", k, getattr(mono, "shape", None), (mono.size/float(44100)))
             stem_sr = spleeter_sr
+            # Record per-stem sample rates (all equal to Spleeter's output rate)
+            stems_sr_map = {k: int(stem_sr) for k in stems_arrays.keys()}
             log.info("Spleeter separation done. Stems=%s sr=%d", sorted(stems_arrays.keys()), stem_sr)
         except Exception as e:
             log.exception("Spleeter separation step failed. Error=%s", e)
@@ -443,6 +449,26 @@ def run_global_analysis(job: dict) -> GlobalContext:
         stems_paths = {}
 
     log.info("Global analysis pre-BPM phase reached; stems_paths=%s", stems_paths)
+
+    # Optional: compute drum-based beat grid directly from drums stem (absolute times)
+    drum_beat_times_abs: List[float] = []
+    try:
+        y_drums = stems_arrays.get("drums") if isinstance(stems_arrays, dict) else None
+        if isinstance(y_drums, np.ndarray) and y_drums.size > 0:
+            try:
+                sr_drums = int(stem_sr)  # set in Spleeter block
+            except Exception:
+                sr_drums = sr  # fallback to mix SR if unavailable
+            # Ensure mono float array
+            yd = y_drums.astype(float, copy=False)
+            _tempo_d, drum_frames = librosa.beat.beat_track(y=yd, sr=sr_drums)
+            drum_times = librosa.frames_to_time(drum_frames, sr=sr_drums)
+            drum_beat_times_abs = drum_times.astype(float).tolist()
+            log.info("Computed drum-based beat grid: count=%d", len(drum_beat_times_abs))
+        else:
+            log.info("No drums stem available for drum-based beat grid")
+    except Exception:
+        log.exception("Drum beat tracking failed; continuing without drum timestamps")
 
     # Prefer beat-interval derived BPM (more stable than onset tempogram)
     hop_length = int(getattr(settings, "hop_length", 512))
@@ -788,5 +814,7 @@ def run_global_analysis(job: dict) -> GlobalContext:
         sr=sr,
         stems_arrays=stems_arrays,
         stems=stems_paths,
+        stems_sr=stems_sr_map,
         t_global=t_global,
+        drum_beat_times=drum_beat_times_abs,
     )

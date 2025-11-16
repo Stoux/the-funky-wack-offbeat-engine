@@ -31,6 +31,7 @@ def _to_global_result(ctx: Any) -> GlobalResult:
         duration_sec=getattr(ctx, "duration_sec", None),
         trimmed_start_sec=getattr(ctx, "trimmed_start_sec", None),
         global_beat_grid_timestamps=list(getattr(ctx, "beat_grid_times", []) or []),
+        global_drum_beat_grid_timestamps=list(getattr(ctx, "drum_beat_times", []) or []),
         stems=dict(getattr(ctx, "stems", {}) or {}),
         global_bpm_curve=[],
         analysis_mode="pure_audio_guess",

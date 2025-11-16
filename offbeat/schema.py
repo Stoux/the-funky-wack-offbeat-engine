@@ -66,6 +66,7 @@ class GlobalResult(BaseModel):
     duration_sec: Optional[float] = None
     trimmed_start_sec: Optional[float] = None
     global_beat_grid_timestamps: List[float] = Field(default_factory=list)
+    global_drum_beat_grid_timestamps: List[float] = Field(default_factory=list)
     # v2: add stems paths relative to shared mount
     stems: Dict[str, str] = Field(default_factory=dict)
     # Legacy/optional

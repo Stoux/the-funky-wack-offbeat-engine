@@ -155,7 +155,9 @@ def _separate_stems(y_chunk: np.ndarray, sr: int) -> Optional[dict]:
 
 def _slice_stem(ctx, stem_name: str, start_sec: float, end_sec: float) -> tuple[np.ndarray, int]:
     stems = getattr(ctx, "stems_arrays", None) or {}
-    sr = int(getattr(ctx, "sr", 22050) or 22050)
+    stems_sr = getattr(ctx, "stems_sr", None) or {}
+    # Use the true stem sample rate if known; otherwise fall back to ctx.sr
+    sr = int(stems_sr.get(stem_name, getattr(ctx, "sr", 22050) or 22050))
     t0 = float(getattr(ctx, "trimmed_start_sec", 0.0) or 0.0)
     start = max(float(start_sec) - t0, 0.0)
     end = max(float(end_sec) - t0, start)
@@ -259,6 +261,29 @@ def _stable_bpm(y_drum: np.ndarray, sr: int, t_global: Optional[float] = None) -
                 guide = guide / 2.0
                 logger.debug("_stable_bpm: reduced high guide %.2f -> %.2f to avoid double-time bias", raw_guide, guide)
 
+        # Compute an unguided baseline tempo once (escape hatch reference)
+        ung: Optional[float]
+        try:
+            ung_bt, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
+            ung = float(ung_bt)
+            if np.isfinite(ung) and ung > 0:
+                if ung < 90.0:
+                    ung *= 2.0
+                # keep within plausible musical range
+                ung = float(np.clip(ung, 60.0, 200.0))
+            else:
+                ung = None
+        except Exception:
+            ung = None
+
+        def _maybe_override(guided_choice: float) -> float:
+            # If we have a valid unguided estimate and it strongly disagrees, prefer unguided
+            if ung is not None and np.isfinite(guided_choice) and guided_choice > 0:
+                if abs(guided_choice - float(ung)) > 8.0:
+                    logger.debug("_stable_bpm: override guided %.2f with unguided %.2f due to disagreement", guided_choice, float(ung))
+                    return float(ung)
+            return guided_choice
+
         # 1) Multi-candidate selection near guide using tempogram peaks
         if guide is not None:
             cands = lr_tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None)
@@ -273,6 +298,7 @@ def _stable_bpm(y_drum: np.ndarray, sr: int, t_global: Optional[float] = None) -
                 expanded = [float(t) for t in expanded if lo <= float(t) <= hi]
                 if expanded:
                     choice = float(min(expanded, key=lambda t: abs(t - guide)))
+                    choice = _maybe_override(choice)
                     logger.debug("_stable_bpm: using candidate selection near guide=%.2f -> %.3f (hop=%d)", guide, choice, hop_length)
                     return choice
 
@@ -292,12 +318,17 @@ def _stable_bpm(y_drum: np.ndarray, sr: int, t_global: Optional[float] = None) -
             cands = [c for c in cands if lo <= c <= hi]
             if cands:
                 choice = float(min(cands, key=lambda t: abs(t - guide)))
+                choice = _maybe_override(choice)
                 logger.debug("_stable_bpm: beat_track biased to guide=%.2f -> %.3f (hop=%d)", guide, choice, hop_length)
                 return choice
             logger.debug("_stable_bpm: beat_track returned tempo=%.3f without valid candidates (hop=%d)", float(tempo_bt), hop_length)
-            return float(tempo_bt)
+            # Even when returning raw tempo_bt, allow escape hatch to apply
+            return _maybe_override(float(tempo_bt))
 
         # 3) Last resort: unbiased beat_track with correct hop_length
+        if ung is not None:
+            logger.debug("_stable_bpm: last-resort using precomputed unguided tempo=%.3f (hop=%d)", float(ung), hop_length)
+            return float(ung)
         tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
         tempo = float(tempo)
         # Reconcile last-resort tempo toward guide if available, else simple half-time fix
@@ -366,20 +397,21 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     end = float(getattr(chunk, "end_sec", start) or start)
 
     # Slice stems from precomputed global stems
-    drums, _ = _slice_stem(ctx, "drums", start, end)
-    bass, _ = _slice_stem(ctx, "bass", start, end)
-    other, _ = _slice_stem(ctx, "other", start, end)
-    vocals, _ = _slice_stem(ctx, "vocals", start, end)
+    drums, drums_sr = _slice_stem(ctx, "drums", start, end)
+    bass, bass_sr = _slice_stem(ctx, "bass", start, end)
+    other, other_sr = _slice_stem(ctx, "other", start, end)
+    vocals, vocals_sr = _slice_stem(ctx, "vocals", start, end)
 
     logger.info(
-        "analyze_track_chunk: track_id={} window=[{:.3f},{:.3f}] dur={:.3f}s sr={} sizes: y={} drums={} bass={} other={} vocals={}",
+        "analyze_track_chunk: track_id={} window=[{:.3f},{:.3f}] dur={:.3f}s ctx_sr={} stem_srs: drums={} bass={} other={} vocals={} sizes: y={} drums={} bass={} other={} vocals={}",
         int(getattr(chunk, "track_id", 0) or 0), start, end, duration, sr,
+        drums_sr, bass_sr, other_sr, vocals_sr,
         y_chunk.size, drums.size, bass.size, other.size, vocals.size,
     )
 
     # Features
     lufs_total = _compute_loudness(y_chunk, sr)
-    lufs_bass = _compute_loudness(bass, sr)
+    lufs_bass = _compute_loudness(bass, bass_sr)
     vocal_rms = float(np.sqrt(np.mean(vocals.astype(float) ** 2))) if vocals.size else None
     has_vocals = (vocal_rms is not None and vocal_rms > 0.02)
     brightness = _compute_brightness(y_chunk, sr)
@@ -390,8 +422,11 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     logger.info(
         "bpm guide window: start=%.2f end=%.2f t_local=%s t_global=%s", start, end, t_local, t_global
     )
-    stable_bpm = _stable_bpm(drums, sr, guide)
-    musical_key = _find_musical_key(bass + other if (bass.size and other.size) else y_chunk, sr)
+    stable_bpm = _stable_bpm(drums, drums_sr, guide)
+    # Choose SR for harmonic key detection: prefer bass stem SR if available, else ctx sr
+    harm = bass + other if (bass.size and other.size) else (bass if bass.size else (other if other.size else y_chunk))
+    harm_sr = bass_sr if bass.size else (other_sr if other.size else sr)
+    musical_key = _find_musical_key(harm, harm_sr)
     camelot_key = _camelot_from_musical(musical_key)
 
     logger.info(
