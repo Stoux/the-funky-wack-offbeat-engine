@@ -69,9 +69,6 @@ class GlobalResult(BaseModel):
     global_drum_beat_grid_timestamps: List[float] = Field(default_factory=list)
     # v2: add stems paths relative to shared mount
     stems: Dict[str, str] = Field(default_factory=dict)
-    # Legacy/optional
-    global_bpm_curve: List[float] = Field(default_factory=list)
-    analysis_mode: str = "pure_audio_guess"
 
 
 class FinalResult(BaseModel):

@@ -27,4 +27,3 @@ def test_run_global_analysis_returns_duration():
         ctx = run_global_analysis(job)
         assert ctx.duration_sec is not None and ctx.duration_sec > 0
         assert ctx.trimmed_start_sec == 0.0
-        assert ctx.analysis_mode in ("pure_audio_guess", "cue_correlated")

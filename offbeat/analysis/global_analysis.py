@@ -150,7 +150,6 @@ class GlobalContext:
     beat_grid_times: List[float]
     # Per-second BPM curve; index i corresponds to time i seconds.
     bpm_curve: List[float]
-    analysis_mode: str
     threads: int
     # Cached audio for downstream use
     y: Optional[np.ndarray] = None
@@ -801,14 +800,11 @@ def run_global_analysis(job: dict) -> GlobalContext:
         bpm_hi = float(getattr(settings, "bpm_max", 190))
         bpm_curve = _clip_range(bpm_curve, bpm_lo, bpm_hi)
 
-    mode = "pure_audio_guess"  # pivot: ignore cues and force pure audio
-
     return GlobalContext(
         duration_sec=duration_sec,
         trimmed_start_sec=time_offset_sec,
         beat_grid_times=[float(t) for t in beat_times_abs],
         bpm_curve=bpm_curve,
-        analysis_mode=mode,
         threads=int(getattr(settings, "threads", 3)),
         y=y_trim,
         sr=sr,

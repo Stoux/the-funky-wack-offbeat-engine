@@ -11,7 +11,6 @@ def test_assemble_result_shape_pure_audio_mode():
         trimmed_start_sec=None,
         beat_grid_times=[],
         bpm_curve=[],
-        analysis_mode="pure_audio_guess",
         threads=3,
     )
 
@@ -26,5 +25,5 @@ def test_assemble_result_shape_pure_audio_mode():
     assert "tracks" in final["results"]
     # validate some keys exist
     g = final["results"]["global"]
-    assert set(["duration_sec", "trimmed_start_sec", "global_beat_grid_timestamps", "global_bpm_curve", "analysis_mode"]).issubset(g.keys())
+    assert set(["duration_sec", "trimmed_start_sec", "global_beat_grid_timestamps", "global_drum_beat_grid_timestamps", "stems"]).issubset(g.keys())
     assert isinstance(final["results"]["tracks"], list)
