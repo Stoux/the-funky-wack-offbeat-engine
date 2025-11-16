@@ -139,11 +139,53 @@ def _slice_stem(ctx, stem_name: str, start_sec: float, end_sec: float) -> tuple[
     return arr[s:e].astype(float, copy=False), sr
 
 
-def _stable_bpm(y_drum: np.ndarray, sr: int) -> Optional[float]:
+def _local_guide_tempo(ctx, start_sec: float, end_sec: float) -> Optional[float]:
+    """Return a robust local guide tempo (median BPM) from ctx.bpm_curve in [start_sec, end_sec].
+    Falls back to None if window is empty or highly unstable.
+    """
+    curve = list(getattr(ctx, "bpm_curve", []) or [])
+    if not curve:
+        return None
+    i0 = int(max(0, np.floor(start_sec)))
+    i1 = int(max(i0, np.ceil(end_sec)))
+    if i1 <= i0:
+        return None
+    window = curve[i0:i1]
+    if not window:
+        return None
+    med = float(np.median(window))
+    if not np.isfinite(med) or med <= 0:
+        return None
+    # Instability check via IQR
+    try:
+        q75, q25 = np.percentile(window, 75), np.percentile(window, 25)
+        iqr = float(q75 - q25)
+        if iqr > 8.0:  # too wobbly; transition/breakdown
+            return None
+    except Exception:
+        pass
+    return med
+
+
+def _stable_bpm(y_drum: np.ndarray, sr: int, t_global: Optional[float] = None) -> Optional[float]:
     if librosa is None or y_drum.size == 0:
         return None
     try:
-        onset_env = librosa.onset.onset_strength(y=y_drum, sr=sr)
+        # Use finer hop for improved resolution
+        hop_length = 256
+        onset_env = librosa.onset.onset_strength(y=y_drum, sr=sr, hop_length=hop_length)
+        # If we have a guide tempo, use multi-candidate selection with half/double expansion
+        if t_global is not None and np.isfinite(t_global) and t_global > 0:
+            cands = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None)
+            if cands is not None and len(cands) > 0:
+                expanded = []
+                for t in cands:
+                    expanded.extend([t/2.0, t, t*2.0])
+                # Filter plausible range
+                expanded = [float(t) for t in expanded if 70.0 <= float(t) <= 200.0]
+                if expanded:
+                    return float(min(expanded, key=lambda t: abs(t - float(t_global))))
+        # Fallback: single tempo estimate with basic half-time correction
         tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
         tempo = float(tempo)
         if tempo < 90:
@@ -211,7 +253,10 @@ def analyze_track_chunk(ctx, chunk) -> Dict[str, Any]:
     vocal_rms = float(np.sqrt(np.mean(vocals.astype(float) ** 2))) if vocals.size else None
     has_vocals = (vocal_rms is not None and vocal_rms > 0.02)
     brightness = _compute_brightness(y_chunk, sr)
-    stable_bpm = _stable_bpm(drums, sr)
+    # Derive local guide tempo from global bpm_curve over this chunk's window; fallback to global
+    t_local = _local_guide_tempo(ctx, start, end)
+    guide = t_local if (t_local is not None) else getattr(ctx, "t_global", None)
+    stable_bpm = _stable_bpm(drums, sr, guide)
     musical_key = _find_musical_key(bass + other if (bass.size and other.size) else y_chunk, sr)
     camelot_key = _camelot_from_musical(musical_key)
 

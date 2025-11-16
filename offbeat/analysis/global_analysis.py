@@ -154,6 +154,8 @@ class GlobalContext:
     # v2 additions
     stems_arrays: Optional[Dict[str, np.ndarray]] = None  # mono arrays for slicing
     stems: Dict[str, str] = None  # relative paths to saved stems
+    # Guide tempo derived from full mix (BPM)
+    t_global: Optional[float] = None
 
 
 def _per_second_resample(times: np.ndarray, values: np.ndarray, duration_sec: float) -> List[float]:
@@ -222,6 +224,17 @@ def run_global_analysis(job: dict) -> GlobalContext:
     beat_times_abs = (beat_times_rel + time_offset_sec).astype(float).tolist()
     if len(beat_times_rel) < 4:
         log.warning("Insufficient beats detected: count=%d; will use onset-based fallback", len(beat_times_rel))
+
+    # Global guide tempo (T_global) using finer hop for resolution
+    try:
+        hop_glob = 256
+        onset_env_full = librosa.onset.onset_strength(y=y_trim, sr=sr, hop_length=hop_glob)
+        tg_arr = librosa.beat.tempo(onset_envelope=onset_env_full, sr=sr, hop_length=hop_glob, aggregate=np.median)
+        t_global = float(tg_arr[0]) if hasattr(tg_arr, "__len__") else float(tg_arr)
+        log.info("Global guide tempo (T_global)=%.2f BPM", t_global)
+    except Exception:
+        log.exception("Failed to compute T_global; continuing without guide tempo")
+        t_global = None
 
     # v2: attempt full-file Spleeter separation and save stems as WAV
     stems_arrays: Optional[Dict[str, np.ndarray]] = None
@@ -431,7 +444,36 @@ def run_global_analysis(job: dict) -> GlobalContext:
     hop_length = int(getattr(settings, "hop_length", 512))
 
     bpm_curve: List[float] = []
-    if len(beat_times_rel) >= 4:
+
+    # Primary: PLP-based dynamic tempo curve (time-varying guide)
+    try:
+        hop_plp = 256
+        oenv_plp = librosa.onset.onset_strength(y=y_trim, sr=sr, hop_length=hop_plp)
+        plp = librosa.beat.plp(onset_envelope=oenv_plp, sr=sr, hop_length=hop_plp)
+        # Convert PLP to dominant BPM per frame
+        bpm_grid = librosa.tempo_frequencies(plp.shape[0], sr=sr, hop_length=hop_plp)
+        idx = np.argmax(plp, axis=0)
+        bpm_series = bpm_grid[idx].astype(float)
+        # Fold BPMs into plausible musical range [60, 200]
+        def _fold(b: float) -> float:
+            if not np.isfinite(b) or b <= 0:
+                return 0.0
+            while b < 60.0:
+                b *= 2.0
+            while b > 200.0:
+                b *= 0.5
+            return b
+        bpm_series = np.array([_fold(float(x)) for x in bpm_series], dtype=float)
+        # Frame times to absolute seconds
+        frame_times_abs = librosa.frames_to_time(np.arange(plp.shape[1]), sr=sr, hop_length=hop_plp) + time_offset_sec
+        # Resample to per-second grid
+        bpm_curve = _per_second_resample(frame_times_abs.astype(float), bpm_series.astype(float), duration_sec)
+        if bpm_curve:
+            log.info("PLP-based tempo curve computed: points=%d", len(bpm_curve))
+    except Exception:
+        log.exception("PLP tempo curve computation failed; will fall back to beat/onset methods")
+
+    if (not bpm_curve) and len(beat_times_rel) >= 4:
         # Instantaneous tempo from consecutive beat intervals
         intervals = np.diff(beat_times_rel)  # seconds per beat
         # Guard against zeros
@@ -541,4 +583,5 @@ def run_global_analysis(job: dict) -> GlobalContext:
         sr=sr,
         stems_arrays=stems_arrays,
         stems=stems_paths,
+        t_global=t_global,
     )
